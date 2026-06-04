@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/jjlin/IsaacLab-2.1.1/source/isaaclab_rl/isaaclab_rl/rsl_rl/**)",
+      "Bash(grep -rn \"resolve_obs_groups\\\\|def resolve_obs\" /home/jjlin/miniconda3/envs/isaaclab/lib/python3.10/site-packages/rsl_rl/ | head -10)",
+      "Read(//home/jjlin/miniconda3/envs/isaaclab/lib/python3.10/site-packages/rsl_rl/**)",
+      "Bash(grep -rn \"obs_groups\" /home/jjlin/miniconda3/envs/isaaclab/lib/python3.10/site-packages/rsl_rl/runners/on_policy_runner.py | head -20)",
+      "Read(//home/jjlin/miniconda3/envs/isaaclab/lib/python3.10/site-packages/rsl_rl/runners/**)",
+      "Bash(python -c \"from rsl_rl.utils import resolve_obs_groups; import inspect; print\\(inspect.signature\\(resolve_obs_groups\\)\\)\")",
+      "Read(//home/jjlin/miniconda3/envs/isaaclab/etc/conda/activate.d/**)",
+      "Read(//home/jjlin/miniconda3/envs/isaaclab/etc/conda/deactivate.d/**)",
+      "Bash(sed -i 's|/home/jjlin/IsaacLab-2.1.1|/home/jjlin/IsaacLab|g' /home/jjlin/miniconda3/envs/isaaclab/etc/conda/activate.d/setenv.sh && cat /home/jjlin/miniconda3/envs/isaaclab/etc/conda/activate.d/setenv.sh)"
+    ],
+    "additionalDirectories": [
+      "/home/jjlin/miniconda3/envs/isaaclab/etc/conda/activate.d"
+    ]
+  }
+}
