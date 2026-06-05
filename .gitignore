@@ -2,7 +2,7 @@ atec_robot_model
 .vscode
 .idea
 video
-logs
+!logs
 tmp
 
 # C++

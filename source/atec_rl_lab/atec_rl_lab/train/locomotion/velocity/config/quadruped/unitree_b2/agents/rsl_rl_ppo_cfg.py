@@ -40,5 +40,5 @@ class UnitreeB2FlatPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 5000
+        self.max_iterations = 10000  # Increased from 5000 for better convergence
         self.experiment_name = "unitree_b2_flat"
