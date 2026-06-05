@@ -23,6 +23,14 @@ class AlgSolution:
         self.leg_joint_indices = list(range(12))
         self.arm_joint_indices = list(range(12, 20))
 
+        # Heading control parameters
+        # Note: stiffness increased from training value (0.5) to 1.5 for stronger
+        # drift correction since proprio integration accumulates error.
+        self.target_heading = 0.0  # Task A: go straight forward (0 radians in world frame)
+        self.heading_control_stiffness = 1.5
+        # Lateral velocity feedback to counter sideways drift in body frame
+        self.lateral_drift_gain = 0.5
+
         # B2 训练时的动作缩放
         self.train_to_env_action_scale = torch.tensor(
             [
@@ -46,12 +54,19 @@ class AlgSolution:
             dtype=torch.float32,
         ).view(1, -1)
 
-        # 固定速度命令（根据你的训练任务调整）
+        # Forward velocity command. Task A goes from x=-141 to x=145 (286m).
+        # Higher forward velocity = faster traversal. 1.0 m/s is a balanced choice.
+        # NOTE: yaw_rate (3rd element) is computed dynamically by heading PD controller.
         self.fixed_velocity_commands = torch.tensor(
-            [0.5, 0.0, 0.0],  # [forward_vel, lateral_vel, yaw_rate]
+            [1.0, 0.0, 0.0],  # [forward_vel, lateral_vel, yaw_rate]
             device=self.device,
             dtype=torch.float32,
         ).view(1, 3)
+
+        # Yaw estimate (integrated from base_ang_vel.z), since proprio doesn't
+        # provide world-frame heading directly. dt = 1/50 (control freq 50Hz).
+        self.estimated_yaw = None  # initialized on first call
+        self.dt = 0.02
 
         self.arm_default_action = torch.zeros(
             (1, self.arm_action_dim),
@@ -77,11 +92,45 @@ class AlgSolution:
         return {}
 
     def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
-        """Return fixed velocity commands for policy input."""
+        """Compute velocity commands with closed-loop heading and lateral drift control.
+
+        Training used heading_command=True with heading_control_stiffness=0.5.
+        We replicate that PD law and additionally compensate for any residual
+        lateral (body-frame y) velocity to keep the robot tracking a straight line.
+        """
         num_envs = proprio.shape[0]
+
+        # Extract base_lin_vel (indices 0:3) and base_ang_vel (indices 3:6)
+        base_lin_vel = proprio[:, 0:3]
+        base_ang_vel = proprio[:, 3:6]
+        yaw_rate_measured = base_ang_vel[:, 2]
+        lateral_vel_measured = base_lin_vel[:, 1]  # body-frame y velocity
+
+        # Integrate yaw_rate to estimate world-frame heading
+        if self.estimated_yaw is None:
+            self.estimated_yaw = torch.zeros(num_envs, device=self.device, dtype=proprio.dtype)
+
+        self.estimated_yaw = self.estimated_yaw + yaw_rate_measured * self.dt
+        self.estimated_yaw = torch.atan2(torch.sin(self.estimated_yaw), torch.cos(self.estimated_yaw))
+
+        # Heading PD: stronger stiffness than training (1.5 vs 0.5) to actively
+        # correct integration drift over the 30+ second episode.
+        heading_error = self.target_heading - self.estimated_yaw
+        heading_error = torch.atan2(torch.sin(heading_error), torch.cos(heading_error))
+
+        # Add lateral-drift compensation: if drifting +y, command negative yaw
+        # rate to turn back toward the +x heading.
+        yaw_rate_cmd = (
+            self.heading_control_stiffness * heading_error
+            - self.lateral_drift_gain * lateral_vel_measured
+        )
+        yaw_rate_cmd = torch.clip(yaw_rate_cmd, -1.0, 1.0)
+
         cmd = self.fixed_velocity_commands.to(dtype=proprio.dtype, device=self.device)
         if num_envs > 1:
             cmd = cmd.repeat(num_envs, 1)
+        cmd[:, 2] = yaw_rate_cmd
+
         return cmd
 
     def _extract_policy_obs(self, obs, action_dim) -> torch.Tensor:
@@ -152,7 +201,8 @@ class AlgSolution:
 
     def predicts(self, obs, current_score):
         """Run policy inference and return current-env full-body action."""
-        if current_score > 1:
+        # Task A total score is 26 (2+4+8+8+4). Don't give up until we've completed it.
+        if current_score >= 26:
             return {'action': [], 'giveup': True}
 
         proprio = obs["proprio"].to(self.device)
