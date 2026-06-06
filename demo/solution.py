@@ -8,7 +8,7 @@ class AlgSolution:
 
     def __init__(self):
         # 使用你训练好的策略
-        policy_path = './atec_robot_model/baseline/unitree_b2_flat/policy.pt'
+        policy_path = './logs/rsl_rl/unitree_b2_rough/2026-06-05_21-41-00/exported/policy.pt'
 
         # 调试用 baseline：
         # policy_path = './atec_robot_model/baseline/unitree_b2_flat/policy.pt'
