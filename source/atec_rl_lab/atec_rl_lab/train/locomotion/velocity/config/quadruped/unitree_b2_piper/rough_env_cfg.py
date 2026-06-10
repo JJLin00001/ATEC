@@ -1,19 +1,24 @@
-# Reference: https://github.com/fan-ziqi/robot_lab
+# Configuration for Unitree B2 Piper (with arms) on rough terrain
 
 from isaaclab.utils import configclass
 
-
 from atec_rl_lab.train.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
-
-from atec_rl_lab.assets.robots import UNITREE_B2_CFG
+from atec_rl_lab.assets.robots import UNITREE_B2_PIPER_CFG
 
 
 @configclass
-class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
+class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
+    """Configuration for B2 Piper robot on rough terrain.
+
+    This uses the full B2Piper model (with arms) but only controls the 12 leg joints.
+    Arms are fixed in stow configuration via init_state.
+
+    This ensures training dynamics match deployment on TaskA-B2Piper.
+    """
     base_link_name = "base_link"
     foot_link_name = ".*_foot"
     # fmt: off
-    joint_names = [
+    leg_joint_names = [
         "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
         "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
         "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
@@ -25,10 +30,22 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # post init of parent
         super().__post_init__()
 
-        # ------------------------------Sence------------------------------
-        self.scene.robot = UNITREE_B2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # ------------------------------Scene------------------------------
+        self.scene.robot = UNITREE_B2_PIPER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
         self.scene.height_scanner_base.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
+
+        # Fix arm joints in stow configuration
+        self.scene.robot.init_state.joint_pos.update({
+            "arm_joint1": 0.0,
+            "arm_joint2": 1.2,
+            "arm_joint3": 0.0,
+            "arm_joint4": -1.5,
+            "arm_joint5": 0.0,
+            "arm_joint6": 0.0,
+            "arm_joint7": 0.0,
+            "arm_joint8": 0.0,
+        })
 
         # ------------------------------Observations------------------------------
         self.observations.policy.base_lin_vel.scale = 2.0
@@ -36,28 +53,29 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.observations.policy.joint_pos.scale = 1.0
         self.observations.policy.joint_vel.scale = 0.05
         self.observations.policy.base_lin_vel = None
-        self.observations.policy.height_scan = None  #屏蔽高度扫描：说明当前训练的是一个纯本体感觉（Proprioceptive）的盲走策略，不依赖相机深度图或雷达。
-        self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
-        self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
+        self.observations.policy.height_scan = None  # Blind policy (proprioceptive only)
+        # Only observe leg joints, not arms
+        self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.leg_joint_names
+        self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.leg_joint_names
 
         # ------------------------------Actions------------------------------
-        # reduce action scale
+        # Only control leg joints (12 DOF)
         self.actions.joint_pos.scale = {".*_hip_joint": 0.125, "^(?!.*_hip_joint).*": 0.25}
         self.actions.joint_pos.clip = {".*": (-100.0, 100.0)}
-        self.actions.joint_pos.joint_names = self.joint_names
+        self.actions.joint_pos.joint_names = self.leg_joint_names
 
         # ------------------------------Events------------------------------
         self.events.randomize_reset_base.params = {
             "pose_range": {
                 "x": (-0.5, 0.5),
                 "y": (-0.5, 0.5),
-                "z": (0.0, 0.05),  # Reduced z variation to start closer to ground
-                "roll": (-0.1, 0.1),  # Much smaller roll range for stable initialization
-                "pitch": (-0.1, 0.1),  # Much smaller pitch range for stable initialization
+                "z": (0.0, 0.05),
+                "roll": (-0.1, 0.1),
+                "pitch": (-0.1, 0.1),
                 "yaw": (-3.14, 3.14),
             },
             "velocity_range": {
-                "x": (-0.2, 0.2),  # Reduced initial velocities
+                "x": (-0.2, 0.2),
                 "y": (-0.2, 0.2),
                 "z": (-0.2, 0.2),
                 "roll": (-0.2, 0.2),
@@ -75,10 +93,11 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_apply_external_force_torque.params["torque_range"] = (-10.0, 10.0)
 
         # ------------------------------Rewards------------------------------
+        # Copy all reward weights from UnitreeB2RoughEnvCfg
         # General
-        self.rewards.is_terminated.weight = -2.0  # Penalize early termination
+        self.rewards.is_terminated.weight = -2.0
 
-        # Root penalties - reduced to not overpower velocity tracking
+        # Root penalties
         self.rewards.lin_vel_z_l2.weight = -1.0
         self.rewards.ang_vel_xy_l2.weight = -0.05
         self.rewards.flat_orientation_l2.weight = -1.5
@@ -92,12 +111,11 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.joint_torques_l2.weight = -1e-5
         self.rewards.joint_vel_l2.weight = 0
         self.rewards.joint_acc_l2.weight = -1e-7
-        # self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_hip_l1", -0.2, [".*_hip_joint"])
         self.rewards.joint_pos_limits.weight = -5.0
         self.rewards.joint_vel_limits.weight = 0
         self.rewards.joint_power.weight = -1e-5
-        self.rewards.stand_still.weight = -1.0  # Reduced from -2.0 to not suppress movement
-        self.rewards.joint_pos_penalty.weight = -0.5  # Reduced from -1.0
+        self.rewards.stand_still.weight = -1.0
+        self.rewards.joint_pos_penalty.weight = -0.5
         self.rewards.joint_mirror.weight = -0.05
         self.rewards.joint_mirror.params["mirror_joints"] = [
             ["FR_(hip|thigh|calf).*", "RL_(hip|thigh|calf).*"],
@@ -113,12 +131,11 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.contact_forces.weight = -1.5e-4
         self.rewards.contact_forces.params["sensor_cfg"].body_names = [self.foot_link_name]
 
-        # Velocity-tracking rewards（核心）- CRITICAL: Increase to prioritize forward motion
-        self.rewards.track_lin_vel_xy_exp.weight = 6.0  # Increased from 3.0 to dominate reward
-        self.rewards.track_ang_vel_z_exp.weight = 2.0   # Increased from 1.5
+        # Velocity-tracking rewards - CRITICAL for forward motion
+        self.rewards.track_lin_vel_xy_exp.weight = 6.0
+        self.rewards.track_ang_vel_z_exp.weight = 2.0
 
-        # Others
-        # DISABLED: feet_air_time can reward long air time, replaced by long_air_time_penalty
+        # Gait rewards - balanced weights
         self.rewards.feet_air_time.weight = 0.0
         self.rewards.feet_air_time.params["threshold"] = 0.3
         self.rewards.feet_air_time.params["sensor_cfg"].body_names = [self.foot_link_name]
@@ -127,17 +144,16 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_air_time_variance.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.feet_air_time_variance.params["sensor_cfg"].preserve_order = True
 
-        # DISABLED: feet_contact uses first_contact (event-based), replaced by current_contact_count_penalty
         self.rewards.feet_contact.weight = 0.0
         self.rewards.feet_contact.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_contact.params["expect_contact_num"] = 2
 
-        # NEW TROT GAIT REWARDS - Balanced weights to avoid overly rigid constraints
+        # NEW TROT GAIT REWARDS
         self.rewards.current_contact_count_penalty.weight = -1.0
         self.rewards.current_contact_count_penalty.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.current_contact_count_penalty.params["sensor_cfg"].preserve_order = True
 
-        self.rewards.long_air_time_penalty.weight = -1.5  # Reduced from -3.0
+        self.rewards.long_air_time_penalty.weight = -1.5
         self.rewards.long_air_time_penalty.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.long_air_time_penalty.params["sensor_cfg"].preserve_order = True
 
@@ -145,54 +161,45 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.diagonal_trot_contact_reward.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.diagonal_trot_contact_reward.params["sensor_cfg"].preserve_order = True
 
-        self.rewards.phase_trot_contact_reward.weight = 1.5  # Reduced from 4.0 to avoid overly rigid phase lock
+        self.rewards.phase_trot_contact_reward.weight = 1.5
         self.rewards.phase_trot_contact_reward.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.phase_trot_contact_reward.params["sensor_cfg"].preserve_order = True
 
         self.rewards.signed_trot_joint_mirror.weight = -0.2
-        self.rewards.signed_trot_joint_mirror.params["asset_cfg"].joint_names = self.joint_names
+        self.rewards.signed_trot_joint_mirror.params["asset_cfg"].joint_names = self.leg_joint_names
 
         self.rewards.signed_trot_action_mirror.weight = -0.1
-        self.rewards.signed_trot_action_mirror.params["asset_cfg"].joint_names = self.joint_names
+        self.rewards.signed_trot_action_mirror.params["asset_cfg"].joint_names = self.leg_joint_names
 
-        # NEW: Balance diagonal pair duty cycles
         self.rewards.diagonal_pair_duty_balance_penalty.weight = -2.0
         self.rewards.diagonal_pair_duty_balance_penalty.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.diagonal_pair_duty_balance_penalty.params["sensor_cfg"].preserve_order = True
 
         self.rewards.feet_contact_without_cmd.weight = 0.1
         self.rewards.feet_contact_without_cmd.params["sensor_cfg"].body_names = [self.foot_link_name]
-        self.rewards.feet_stumble.weight = -0.1  # Penalize stumbling
+        self.rewards.feet_stumble.weight = -0.1
         self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
-        self.rewards.feet_slide.weight = -0.5  # Penalize feet sliding
+        self.rewards.feet_slide.weight = -0.5
         self.rewards.feet_slide.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_height.weight = 0
         self.rewards.feet_height.params["target_height"] = 0.05
         self.rewards.feet_height.params["asset_cfg"].body_names = [self.foot_link_name]
-        self.rewards.feet_height_body.weight = -2.0  # Reduced from -5.0 to allow proper leg lift
+        self.rewards.feet_height_body.weight = -2.0
         self.rewards.feet_height_body.params["target_height"] = -0.4
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
 
-        self.rewards.feet_gait.weight = 3.0  # Increased from 2.0
+        self.rewards.feet_gait.weight = 3.0
         self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot"))
-        self.rewards.upward.weight = 4.0  # Increased from 3.0 to encourage dynamic gait
+        self.rewards.upward.weight = 4.0
 
-        # If the weight of rewards is 0, set rewards to None
-        if self.__class__.__name__ == "UnitreeB2RoughEnvCfg":
+        # Disable zero-weight rewards
+        if self.__class__.__name__ == "UnitreeB2PiperRoughEnvCfg":
             self.disable_zero_weight_rewards()
 
         # ------------------------------Terminations------------------------------
-        # Terminate when robot's body (non-foot parts) hit the ground
         self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name, ".*_hip", ".*_thigh"]
 
         # ------------------------------Curriculums------------------------------
-        # self.curriculum.command_levels_lin_vel.params["range_multiplier"] = (0.2, 1.0)
-        # self.curriculum.command_levels_ang_vel.params["range_multiplier"] = (0.2, 1.0)
         self.curriculum.command_levels_lin_vel = None
         self.curriculum.command_levels_ang_vel = None
-
-        # ------------------------------Commands------------------------------
-        # self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
-        # self.commands.base_velocity.ranges.lin_vel_y = (-2.0, 2.0)
-        # self.commands.base_velocity.ranges.ang_vel_z = (-1.5, 1.5)

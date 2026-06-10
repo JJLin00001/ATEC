@@ -81,7 +81,7 @@ def play() -> tuple[float, float]:
 
     # New Feature: apply safe action spec to env config (e.g. for scaling/clipping actions from your solution)
     env_cfg = apply_safe_action_spec(env_cfg, action_spec_json)
-    
+
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # Convert MARL -> single agent if needed (kept from your original script)
@@ -111,6 +111,36 @@ def play() -> tuple[float, float]:
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
+
+    # -------------------------------------------------------------------------
+    # Debug diagnostics setup
+    # -------------------------------------------------------------------------
+    if args_cli.debug:
+        try:
+            from isaaclab.sensors import ContactSensor
+            robot = env.unwrapped.scene["robot"]
+
+            # Try both sensor names: "contact_forces" (training) and "contact_sensor" (eval tasks)
+            contact_sensor = env.unwrapped.scene.sensors.get("contact_forces", None)
+            if contact_sensor is None:
+                contact_sensor = env.unwrapped.scene.sensors.get("contact_sensor", None)
+
+            # Get foot body names from robot config
+            if hasattr(robot.cfg, "leg_joint_names"):
+                foot_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
+            else:
+                foot_names = None
+                contact_sensor = None
+
+            # Initialize duty factor tracking (2 seconds = 100 steps at 50Hz)
+            duty_cycle_window = 100
+            foot_contact_history = {name: [] for name in (foot_names or [])}
+
+        except Exception as e:
+            print(f"[DEBUG] Could not initialize contact sensor: {e}")
+            contact_sensor = None
+            foot_names = None
+            foot_contact_history = {}
 
     # -------------------------------------------------------------------------
     # Play loop
@@ -145,8 +175,81 @@ def play() -> tuple[float, float]:
                 total_elapsed_time += dt  # wall clock time as fallback
 
             if args_cli.debug:
-                print(f"total_episode_reward:{total_episode_reward: .2f}")
-                print(f"total_elapsed_time:{total_elapsed_time: .2f}")
+                # Basic metrics
+                print(f"\n[Step {timestep}] score={total_episode_reward:.2f}, elapsed={total_elapsed_time:.2f}s")
+
+                # Robot state diagnostics
+                try:
+                    robot = env.unwrapped.scene["robot"]
+                    root_pos = robot.data.root_pos_w[0].cpu().numpy()
+                    root_vel = robot.data.root_lin_vel_b[0].cpu().numpy()
+                    root_quat = robot.data.root_quat_w[0].cpu().numpy()
+                    print(f"  Root: pos=[{root_pos[0]:.2f}, {root_pos[1]:.2f}, {root_pos[2]:.2f}], "
+                          f"vel_b=[{root_vel[0]:.2f}, {root_vel[1]:.2f}, {root_vel[2]:.2f}]")
+
+                    # Foot contact diagnostics with full details
+                    if contact_sensor is not None and foot_names is not None:
+                        try:
+                            foot_ids = [contact_sensor.find_bodies([name])[0][0] for name in foot_names]
+                            net_forces = contact_sensor.data.net_forces_w[0, foot_ids].cpu().numpy()
+                            air_times = contact_sensor.data.current_air_time[0, foot_ids].cpu().numpy()
+                            contact_times = contact_sensor.data.current_contact_time[0, foot_ids].cpu().numpy()
+
+                            # Get foot positions in world and body frame
+                            foot_pos_w = robot.data.body_pos_w[0, foot_ids].cpu().numpy()
+                            foot_pos_b = torch.zeros(len(foot_ids), 3, device=robot.device)
+                            for i in range(len(foot_ids)):
+                                foot_pos_rel = foot_pos_w[i] - root_pos
+                                # Transform to body frame using quaternion
+                                from isaaclab.utils.math import quat_apply_inverse
+                                quat_tensor = torch.tensor(root_quat, device=robot.device).unsqueeze(0)
+                                pos_rel_tensor = torch.tensor(foot_pos_rel, device=robot.device).unsqueeze(0)
+                                foot_pos_b[i] = quat_apply_inverse(quat_tensor, pos_rel_tensor)[0]
+                            foot_pos_b = foot_pos_b.cpu().numpy()
+
+                            print(f"  Feet:")
+                            for i, name in enumerate(foot_names):
+                                contact_force = float(torch.norm(torch.tensor(net_forces[i])).item())
+                                is_contact = contact_force > 1.0
+                                contact_status = "CONTACT" if is_contact else "AIR    "
+
+                                # Update duty factor history
+                                foot_contact_history[name].append(is_contact)
+                                if len(foot_contact_history[name]) > duty_cycle_window:
+                                    foot_contact_history[name].pop(0)
+
+                                # Calculate duty factor (percentage of time in contact over last 2s)
+                                if len(foot_contact_history[name]) > 0:
+                                    duty_factor = sum(foot_contact_history[name]) / len(foot_contact_history[name])
+                                else:
+                                    duty_factor = 0.0
+
+                                print(f"    {name:8s} (id={foot_ids[i]:2d}): {contact_status} "
+                                      f"force={contact_force:6.1f}N air={air_times[i]:.3f}s contact={contact_times[i]:.3f}s "
+                                      f"z={foot_pos_w[i][2]:.3f}m "
+                                      f"pos_b=[{foot_pos_b[i][0]:+.3f},{foot_pos_b[i][1]:+.3f},{foot_pos_b[i][2]:+.3f}] "
+                                      f"duty={duty_factor:.2%}")
+
+                        except Exception as e:
+                            print(f"  [Foot diagnostics error: {e}]")
+
+                    # Leg action diagnostics (first 12 actions are legs for B2Piper)
+                    leg_actions = actions[0, :12].cpu().numpy()
+                    print(f"  Leg actions: FR=[{leg_actions[0]:+.2f},{leg_actions[1]:+.2f},{leg_actions[2]:+.2f}] "
+                          f"FL=[{leg_actions[3]:+.2f},{leg_actions[4]:+.2f},{leg_actions[5]:+.2f}] "
+                          f"RR=[{leg_actions[6]:+.2f},{leg_actions[7]:+.2f},{leg_actions[8]:+.2f}] "
+                          f"RL=[{leg_actions[9]:+.2f},{leg_actions[10]:+.2f},{leg_actions[11]:+.2f}]")
+
+                    # Arm actions if present
+                    if actions.shape[1] >= 20:
+                        arm_actions = actions[0, 12:20].cpu().numpy()
+                        print(f"  Arm actions: [{arm_actions[0]:+.2f},{arm_actions[1]:+.2f},"
+                              f"{arm_actions[2]:+.2f},{arm_actions[3]:+.2f},"
+                              f"{arm_actions[4]:+.2f},{arm_actions[5]:+.2f},"
+                              f"{arm_actions[6]:+.2f},{arm_actions[7]:+.2f}]")
+
+                except Exception as e:
+                    print(f"  [Diagnostics error: {e}]")
 
             done = (terminated.item() or truncated.item())
             if done:

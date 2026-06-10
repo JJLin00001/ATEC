@@ -684,3 +684,339 @@ def flat_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scen
     reward = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+
+# ==============================================================================
+# NEW TROT GAIT REWARDS - Added for solving RL_foot long air time issue
+# ==============================================================================
+
+
+def current_contact_count_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    expect_contact_num: int,
+    force_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize when current number of feet in contact != expect_contact_num.
+
+    Unlike feet_contact which uses compute_first_contact (only triggers on contact events),
+    this reward evaluates the CURRENT instantaneous contact state based on force magnitude.
+    This provides continuous feedback to maintain the desired contact pattern at every timestep.
+
+    Args:
+        expect_contact_num: Expected number of feet in contact (2 for trot gait)
+        force_threshold: Minimum force (N) to consider a foot in contact (default 1.0)
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # Compute current contact based on force magnitude (NOT first_contact events)
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]  # (num_envs, num_feet, 3)
+    force_magnitude = torch.linalg.norm(net_forces, dim=2)  # (num_envs, num_feet)
+    is_contact = force_magnitude > force_threshold  # (num_envs, num_feet)
+
+    # Count current number of feet in contact
+    current_contact_count = torch.sum(is_contact.float(), dim=1)  # (num_envs,)
+
+    # Penalize deviation from expected contact count
+    penalty = torch.abs(current_contact_count - expect_contact_num)
+
+    # Only apply when moving
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty
+
+
+def long_air_time_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    air_time_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize any foot that has current_air_time > threshold.
+
+    This directly targets the RL_foot long air time problem by penalizing EACH foot
+    individually when it stays airborne too long. The penalty scales with how much
+    the air time exceeds the threshold.
+
+    Args:
+        air_time_threshold: Maximum allowed continuous air time (e.g., 0.35s)
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # Get current air time for each foot
+    current_air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]  # (num_envs, num_feet)
+
+    # Penalize when air time exceeds threshold, with linear scaling
+    excess_air_time = torch.clamp(current_air_time - air_time_threshold, min=0.0)
+    penalty = torch.sum(excess_air_time, dim=1)  # Sum across all feet
+
+    # Only apply when moving
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty
+
+
+def diagonal_trot_contact_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    force_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Reward diagonal trot contact pattern (FR+RL or FL+RR), penalize others.
+
+    Trot gait contact patterns:
+    - GOOD: FR+RL (diagonal), FL+RR (diagonal), or 1 foot (transition)
+    - BAD: FR+FL (same side), RR+RL (same side), 3 feet, 4 feet
+
+    This reward directly shapes the desired gait pattern at the contact level.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # Compute current contact state
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    force_magnitude = torch.linalg.norm(net_forces, dim=2)
+    is_contact = force_magnitude > force_threshold  # (num_envs, 4) for [FR, FL, RR, RL]
+
+    # Extract individual foot contact states (assuming order FR, FL, RR, RL)
+    FR_contact = is_contact[:, 0]
+    FL_contact = is_contact[:, 1]
+    RR_contact = is_contact[:, 2]
+    RL_contact = is_contact[:, 3]
+
+    # Diagonal pairs
+    diagonal_1 = FR_contact & RL_contact  # FR + RL
+    diagonal_2 = FL_contact & RR_contact  # FL + RR
+
+    # Same-side pairs (BAD)
+    same_side_front = FR_contact & FL_contact  # Front pair
+    same_side_rear = RR_contact & RL_contact   # Rear pair
+
+    # Count total contacts
+    contact_count = torch.sum(is_contact.float(), dim=1)
+
+    # Reward structure:
+    # +1.0 for diagonal pairs (good trot)
+    # -0.5 for same-side pairs (bad pattern)
+    # -0.3 for 3 or 4 feet contact (bad pattern)
+    # 0.0 for single foot (neutral, transition phase)
+
+    reward = torch.zeros(env.num_envs, device=env.device)
+    reward += diagonal_1.float() * 1.0
+    reward += diagonal_2.float() * 1.0
+    reward -= same_side_front.float() * 0.5
+    reward -= same_side_rear.float() * 0.5
+    reward -= ((contact_count == 3) | (contact_count == 4)).float() * 0.3
+
+    # Only apply when moving
+    reward *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return reward
+
+
+def phase_trot_contact_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    cycle_time: float,
+    force_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Reward phase-synchronized trot: first half expects FR+RL, second half expects FL+RR.
+
+    FIXED: Symmetric logic - each phase rewards its expected pair and penalizes wrong pairs.
+    - Phase [0, 0.5): expect FR+RL diagonal, penalize FR/RL missing, penalize FL/RR over-contact
+    - Phase [0.5, 1.0): expect FL+RR diagonal, penalize FL/RR missing, penalize FR/RL over-contact
+
+    No single foot gets special treatment across both half-cycles.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # Compute current gait phase
+    if not hasattr(env, "episode_length_buf") or env.episode_length_buf is None:
+        env.episode_length_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    phase = (env.episode_length_buf * env.step_dt / cycle_time) % 1.0  # Range [0, 1)
+
+    # Compute current contact state
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    force_magnitude = torch.linalg.norm(net_forces, dim=2)
+    is_contact = force_magnitude > force_threshold  # (num_envs, 4) body_ids order specified in cfg
+
+    # Extract foot contact (order matches sensor_cfg.body_names)
+    FR_contact = is_contact[:, 0]
+    FL_contact = is_contact[:, 1]
+    RR_contact = is_contact[:, 2]
+    RL_contact = is_contact[:, 3]
+
+    # Expected contact patterns by phase
+    first_half = phase < 0.5  # Expect FR+RL
+    second_half = phase >= 0.5  # Expect FL+RR
+
+    # Reward for matching expected pattern
+    reward = torch.zeros(env.num_envs, device=env.device)
+
+    # First half: reward FR+RL diagonal match
+    diagonal_1_match = (FR_contact & RL_contact).float()
+    reward += torch.where(first_half, diagonal_1_match * 1.0, torch.zeros_like(reward))
+
+    # Penalize missing FR or RL in first half
+    reward -= torch.where(first_half & ~FR_contact, torch.ones_like(reward) * 0.8, torch.zeros_like(reward))
+    reward -= torch.where(first_half & ~RL_contact, torch.ones_like(reward) * 0.8, torch.zeros_like(reward))
+
+    # Penalize FL/RR over-contact in first half (they should be in air)
+    reward -= torch.where(first_half & FL_contact & RR_contact, torch.ones_like(reward) * 0.5, torch.zeros_like(reward))
+
+    # Second half: reward FL+RR diagonal match
+    diagonal_2_match = (FL_contact & RR_contact).float()
+    reward += torch.where(second_half, diagonal_2_match * 1.0, torch.zeros_like(reward))
+
+    # Penalize missing FL or RR in second half
+    reward -= torch.where(second_half & ~FL_contact, torch.ones_like(reward) * 0.8, torch.zeros_like(reward))
+    reward -= torch.where(second_half & ~RR_contact, torch.ones_like(reward) * 0.8, torch.zeros_like(reward))
+
+    # Penalize FR/RL over-contact in second half (they should be in air)
+    reward -= torch.where(second_half & FR_contact & RL_contact, torch.ones_like(reward) * 0.5, torch.zeros_like(reward))
+
+    # Only apply when moving
+    reward *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return reward
+
+
+def signed_trot_joint_mirror(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize joint position asymmetry for diagonal trot pairs with signed mirror.
+
+    For quadruped trot, diagonal legs (FR-RL, FL-RR) should mirror each other:
+    - Hip joints: OPPOSITE signs (left hip > 0, right hip < 0)
+    - Thigh/Calf joints: SAME signs (both flex/extend together)
+
+    Joint order assumed: FR[hip,thigh,calf], FL[hip,thigh,calf], RR[hip,thigh,calf], RL[hip,thigh,calf]
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]  # (num_envs, 12)
+
+    # Extract diagonal pairs
+    FR = joint_pos[:, 0:3]  # [hip, thigh, calf]
+    FL = joint_pos[:, 3:6]
+    RR = joint_pos[:, 6:9]
+    RL = joint_pos[:, 9:12]
+
+    # Diagonal pair 1: FR - RL
+    # Hip: opposite signs (negate FR hip for comparison)
+    hip_diff_1 = torch.abs(-FR[:, 0] - RL[:, 0])
+    # Thigh/Calf: same signs
+    thigh_diff_1 = torch.abs(FR[:, 1] - RL[:, 1])
+    calf_diff_1 = torch.abs(FR[:, 2] - RL[:, 2])
+
+    # Diagonal pair 2: FL - RR
+    hip_diff_2 = torch.abs(-FL[:, 0] - RR[:, 0])
+    thigh_diff_2 = torch.abs(FL[:, 1] - RR[:, 1])
+    calf_diff_2 = torch.abs(FL[:, 2] - RR[:, 2])
+
+    # Total penalty
+    penalty = hip_diff_1 + thigh_diff_1 + calf_diff_1 + hip_diff_2 + thigh_diff_2 + calf_diff_2
+
+    # Only apply when moving
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty
+
+
+def signed_trot_action_mirror(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize action asymmetry for diagonal trot pairs with signed mirror.
+
+    Same as signed_trot_joint_mirror but applied to actions instead of joint positions.
+    This encourages symmetric control commands to diagonal leg pairs.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    actions = env.action_manager.action[:, asset_cfg.joint_ids]  # (num_envs, 12)
+
+    # Extract diagonal pairs
+    FR_act = actions[:, 0:3]
+    FL_act = actions[:, 3:6]
+    RR_act = actions[:, 6:9]
+    RL_act = actions[:, 9:12]
+
+    # Diagonal pair 1: FR - RL (signed mirror)
+    hip_diff_1 = torch.abs(-FR_act[:, 0] - RL_act[:, 0])
+    thigh_diff_1 = torch.abs(FR_act[:, 1] - RL_act[:, 1])
+    calf_diff_1 = torch.abs(FR_act[:, 2] - RL_act[:, 2])
+
+    # Diagonal pair 2: FL - RR (signed mirror)
+    hip_diff_2 = torch.abs(-FL_act[:, 0] - RR_act[:, 0])
+    thigh_diff_2 = torch.abs(FL_act[:, 1] - RR_act[:, 1])
+    calf_diff_2 = torch.abs(FL_act[:, 2] - RR_act[:, 2])
+
+    # Total penalty
+    penalty = hip_diff_1 + thigh_diff_1 + calf_diff_1 + hip_diff_2 + thigh_diff_2 + calf_diff_2
+
+    # Only apply when moving
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty
+
+
+def diagonal_pair_duty_balance_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize duty cycle imbalance between diagonal pairs (FR+RL vs FL+RR).
+
+    Uses current_air_time and current_contact_time as stateless approximations
+    to measure whether the two diagonal pairs have balanced duty cycles.
+
+    This prevents one diagonal pair from dominating (high duty) while the other
+    barely touches the ground (low duty), which would cause asymmetric gait.
+
+    Expected behavior: Both pairs should have similar average air/contact times
+    for a balanced trot gait (~50% duty each).
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # Get current air and contact times (order matches sensor_cfg.body_names)
+    current_air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]  # (num_envs, 4)
+    current_contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+
+    # Extract times for each foot (order: FR, FL, RR, RL)
+    FR_air = current_air_time[:, 0]
+    FL_air = current_air_time[:, 1]
+    RR_air = current_air_time[:, 2]
+    RL_air = current_air_time[:, 3]
+
+    FR_contact = current_contact_time[:, 0]
+    FL_contact = current_contact_time[:, 1]
+    RR_contact = current_contact_time[:, 2]
+    RL_contact = current_contact_time[:, 3]
+
+    # Diagonal pair averages
+    pair1_air = (FR_air + RL_air) / 2.0    # FR+RL diagonal
+    pair2_air = (FL_air + RR_air) / 2.0    # FL+RR diagonal
+
+    pair1_contact = (FR_contact + RL_contact) / 2.0
+    pair2_contact = (FL_contact + RR_contact) / 2.0
+
+    # Penalize imbalance in both air and contact times
+    air_imbalance = torch.abs(pair1_air - pair2_air)
+    contact_imbalance = torch.abs(pair1_contact - pair2_contact)
+
+    penalty = air_imbalance + contact_imbalance
+
+    # Only apply when moving
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty

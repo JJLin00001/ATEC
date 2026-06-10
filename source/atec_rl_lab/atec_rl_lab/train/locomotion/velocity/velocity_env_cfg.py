@@ -171,6 +171,12 @@ class ObservationsCfg:
             clip=(-100.0, 100.0),
             scale=1.0,
         )
+        phase = ObsTerm(
+            func=mdp.phase,
+            params={"cycle_time": 0.5},
+            clip=(-1.0, 1.0),
+            scale=1.0,
+        )
         height_scan = ObsTerm(
             func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
@@ -224,6 +230,12 @@ class ObservationsCfg:
         actions = ObsTerm(
             func=mdp.last_action,
             clip=(-100.0, 100.0),
+            scale=1.0,
+        )
+        phase = ObsTerm(
+            func=mdp.phase,
+            params={"cycle_time": 0.5},
+            clip=(-1.0, 1.0),
             scale=1.0,
         )
         height_scan = ObsTerm(
@@ -537,7 +549,7 @@ class RewardsCfg:
     feet_air_time_variance = RewTerm(
         func=mdp.feet_air_time_variance_penalty,
         weight=0,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="")},
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True)},
     )
 
     feet_gait = RewTerm(
@@ -635,6 +647,76 @@ class RewardsCfg:
     # )
 
     upward = RewTerm(func=mdp.upward, weight=0.0)
+
+    # NEW: Trot gait enforcement rewards
+    current_contact_count_penalty = RewTerm(
+        func=mdp.current_contact_count_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "expect_contact_num": 2,
+            "force_threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
+
+    long_air_time_penalty = RewTerm(
+        func=mdp.long_air_time_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "air_time_threshold": 0.35,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
+
+    diagonal_trot_contact_reward = RewTerm(
+        func=mdp.diagonal_trot_contact_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "force_threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
+
+    phase_trot_contact_reward = RewTerm(
+        func=mdp.phase_trot_contact_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cycle_time": 0.5,
+            "force_threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
+
+    signed_trot_joint_mirror = RewTerm(
+        func=mdp.signed_trot_joint_mirror,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True),
+        },
+    )
+
+    signed_trot_action_mirror = RewTerm(
+        func=mdp.signed_trot_action_mirror,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True),
+        },
+    )
+
+    diagonal_pair_duty_balance_penalty = RewTerm(
+        func=mdp.diagonal_pair_duty_balance_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
 
 
 @configclass
