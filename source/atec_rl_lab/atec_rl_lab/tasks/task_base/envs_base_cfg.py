@@ -409,3 +409,7 @@ class BaseEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.ee_dual_camera = None
             self.observations.image.ee_dual_rgb = None
             self.observations.image.ee_dual_depth = None
+
+        if os.environ.get("ATEC_DISABLE_LIDAR", "0") == "1":
+            self.scene.lidar_sensor = None
+            self.observations.extero = None

@@ -636,6 +636,22 @@ class RewardsCfg:
 
     upward = RewTerm(func=mdp.upward, weight=0.0)
 
+    # Straight-line walking helpers (default disabled; enable per-task)
+    lin_vel_y_l2 = RewTerm(func=mdp.lin_vel_y_l2, weight=0.0)
+    yaw_rate_l2 = RewTerm(func=mdp.yaw_rate_l2, weight=0.0)
+
+    # Diagonal-pair air-time balance penalty: keeps FL+RR vs FR+RL trotting symmetric
+    diagonal_pair_air_time_balance = RewTerm(
+        func=mdp.diagonal_pair_air_time_balance_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=""),
+            "synced_feet_pair_names": (("", ""), ("", "")),
+            "max_time": 0.5,
+        },
+    )
+
 
 @configclass
 class TerminationsCfg:

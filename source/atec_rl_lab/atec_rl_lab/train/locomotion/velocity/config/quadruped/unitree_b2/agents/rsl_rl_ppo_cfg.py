@@ -42,3 +42,18 @@ class UnitreeB2FlatPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
 
         self.max_iterations = 10000  # Increased from 5000 for better convergence
         self.experiment_name = "unitree_b2_flat"
+
+
+@configclass
+class UnitreeB2PiperRoughPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
+    """PPO runner cfg for B2Piper rough locomotion.
+
+    Inherits all PPO hyperparameters from B2 rough so warm-starting from the existing
+    unitree_b2_rough checkpoint stays well-defined. Only the experiment_name (and
+    therefore the log directory) changes.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "unitree_b2_piper_rough"

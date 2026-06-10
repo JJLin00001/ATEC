@@ -4,11 +4,14 @@
 Implementation of Task A environment configuration with different robots.
 """
 
+import os
+
 from isaaclab.utils import configclass
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from atec_rl_lab.tasks.task_base import TerminationsCfg
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import MultiMeshRayCasterCfg, RayCasterCfg, patterns
 
 from atec_rl_lab.tasks.task_base import BaseEnvCfg
 from .terrain import TASK_A_TERRAIN_CFG
@@ -34,7 +37,7 @@ class RewardsCfg:
             "x_thresholds": [-115.0, -35.0, 45.0, 125.0, 140.0],
             "rewards": [2.0, 4.0, 8.0, 8.0, 4.0],
             "debug": False,
-            "visual_assets": True,
+            "visual_assets": False,
         },
         weight=1.0,
     )
@@ -54,8 +57,10 @@ class TaskAEnvCfg(BaseEnvCfg):
 
         # Turn off the DR and noise
         self.observations.proprio.enable_corruption = False
-        self.observations.extero.enable_corruption = False
-        self.observations.image.enable_corruption = False
+        if self.observations.extero is not None:
+            self.observations.extero.enable_corruption = False
+        if self.observations.image is not None:
+            self.observations.image.enable_corruption = False
         self.events.physics_material = None
         self.events.base_external_force_torque = None
         self.events.reset_robot_joints = None
@@ -195,6 +200,27 @@ class TaskAEnvB2Cfg(TaskAEnvCfg):
             )
         )
         super().__post_init__()
+
+        if self.scene.lidar_sensor is not None:
+            if os.environ.get("ATEC_ENABLE_LIDAR", "0") != "1":
+                self.scene.lidar_sensor = None
+                self.observations.extero = None
+            else:
+                lidar_sensor = self.scene.lidar_sensor
+                self.scene.lidar_sensor = MultiMeshRayCasterCfg(
+                    prim_path=lidar_sensor.prim_path,
+                    update_period=self.decimation * self.sim.dt,
+                    pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+                    max_distance=lidar_sensor.max_distance,
+                    debug_vis=lidar_sensor.debug_vis,
+                    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+                    attach_yaw_only=lidar_sensor.attach_yaw_only,
+                    ray_alignment="yaw",
+                    drift_range=lidar_sensor.drift_range,
+                    ray_cast_drift_range=lidar_sensor.ray_cast_drift_range,
+                    visualizer_cfg=lidar_sensor.visualizer_cfg,
+                    mesh_prim_paths=["/World/ground"],
+                )
 
         self.terminations.illegal_contact.params["sensor_cfg"].body_names = [
             UNITREE_B2_PIPER_CFG.base_link_name,

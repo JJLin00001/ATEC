@@ -661,6 +661,68 @@ def ang_vel_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
     return reward
 
 
+def lin_vel_y_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize body-frame y-axis linear velocity using L2 squared kernel.
+
+    Used to enforce straight-line walking by penalizing lateral drift.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_lin_vel_b[:, 1])
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def yaw_rate_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize body-frame yaw angular velocity using L2 squared kernel.
+
+    Used to enforce straight-line walking by suppressing turning when not commanded.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_ang_vel_b[:, 2])
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def diagonal_pair_air_time_balance_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    synced_feet_pair_names,
+    max_time: float = 0.5,
+) -> torch.Tensor:
+    """Penalize imbalance in air time / contact time between two diagonal foot pairs.
+
+    Designed to make FL+RR and FR+RL diagonal groups exhibit symmetric trotting timing.
+    Only active when command norm > 0.1, gated by upright posture.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    if not hasattr(env, "_diag_pair_air_time_cache") or env._diag_pair_air_time_cache is None:
+        pair_a_ids = contact_sensor.find_bodies(synced_feet_pair_names[0])[0]
+        pair_b_ids = contact_sensor.find_bodies(synced_feet_pair_names[1])[0]
+        env._diag_pair_air_time_cache = (pair_a_ids, pair_b_ids)
+    pair_a_ids, pair_b_ids = env._diag_pair_air_time_cache
+
+    air_time = contact_sensor.data.current_air_time
+    contact_time = contact_sensor.data.current_contact_time
+
+    air_clipped = torch.clamp(air_time, max=max_time)
+    contact_clipped = torch.clamp(contact_time, max=max_time)
+
+    pair_a_air_mean = torch.mean(air_clipped[:, pair_a_ids], dim=1)
+    pair_b_air_mean = torch.mean(air_clipped[:, pair_b_ids], dim=1)
+    pair_a_contact_mean = torch.mean(contact_clipped[:, pair_a_ids], dim=1)
+    pair_b_contact_mean = torch.mean(contact_clipped[:, pair_b_ids], dim=1)
+
+    air_diff = torch.square(pair_a_air_mean - pair_b_air_mean)
+    contact_diff = torch.square(pair_a_contact_mean - pair_b_contact_mean)
+    reward = air_diff + contact_diff
+
+    reward *= torch.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
 def undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize undesired contacts as the number of violations that are above a threshold."""
     # extract the used quantities (to enable type-hinting)

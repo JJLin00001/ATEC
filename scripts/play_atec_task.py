@@ -7,6 +7,11 @@ import json
 
 from isaaclab.app import AppLauncher
 
+
+def log_stage(message: str):
+    print(f"[PLAY] {message}", flush=True)
+
+
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
@@ -25,6 +30,12 @@ parser.add_argument(
     default=False,
     help="Enable debug prints for per-step reward/time metrics.",
 )
+parser.add_argument(
+    "--debug_interval",
+    type=int,
+    default=50,
+    help="Print debug metrics every N simulation steps.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -38,8 +49,10 @@ if args_cli.video:
 # -----------------------------------------------------------------------------
 # Launch Isaac Sim / Kit
 # -----------------------------------------------------------------------------
+log_stage("launching Isaac Sim app")
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+log_stage("Isaac Sim app launched")
 
 # -----------------------------------------------------------------------------
 # Imports AFTER simulation_app is created (IsaacLab pattern)
@@ -58,7 +71,9 @@ from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from demo.solution import AlgSolution
+log_stage("loading solution policy")
 solution = AlgSolution()
+log_stage(f"solution policy loaded, obs_dim={solution.policy_obs_dim}")
 
 def play() -> tuple[float, float]:
     if args_cli.task is None:
@@ -68,12 +83,14 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     # Create env (plain Gym env)
     # -------------------------------------------------------------------------
+    log_stage("parsing environment config")
     env_cfg = parse_env_cfg(
         args_cli.task,
         device=args_cli.device,
         num_envs=args_cli.num_envs,
         use_fabric=not args_cli.disable_fabric
     )
+    log_stage("environment config parsed")
 
     # TODO: simulate getting action spec from jason string (e.g. from a file or network)
     action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
@@ -82,7 +99,9 @@ def play() -> tuple[float, float]:
     # New Feature: apply safe action spec to env config (e.g. for scaling/clipping actions from your solution)
     env_cfg = apply_safe_action_spec(env_cfg, action_spec_json)
     
+    log_stage("creating gym environment")
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    log_stage("gym environment created")
 
     # Convert MARL -> single agent if needed (kept from your original script)
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -107,7 +126,12 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     # Reset
     # -------------------------------------------------------------------------
+    log_stage("resetting environment")
     obs, _ = env.reset()
+    log_stage(
+        "environment reset complete: "
+        + ", ".join(f"{key}={tuple(value.shape)}" for key, value in obs.items() if hasattr(value, "shape"))
+    )
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
@@ -122,13 +146,21 @@ def play() -> tuple[float, float]:
             start_time = time.time()
 
             # ===== Your controller goes here =====
+            if timestep == 0:
+                log_stage("running first policy inference")
             resp = solution.predicts(obs, total_episode_reward)
+            if timestep == 0:
+                log_stage("first policy inference complete")
             giveup = resp["giveup"]
             if giveup:
                 break
             actions = resp["action"]
             actions = torch.tensor(actions, dtype=torch.float32, device='cuda').view(1, -1)
+            if timestep == 0:
+                log_stage(f"stepping environment with action_shape={tuple(actions.shape)}")
             obs, reward, terminated, truncated, info = env.step(actions)
+            if timestep == 0:
+                log_stage("first environment step complete")
             if not is_task_e and not args_cli.headless:
                 camera_follow(env)
 
@@ -144,7 +176,7 @@ def play() -> tuple[float, float]:
             elif dt is not None:
                 total_elapsed_time += dt  # wall clock time as fallback
 
-            if args_cli.debug:
+            if args_cli.debug and timestep % max(args_cli.debug_interval, 1) == 0:
                 print(f"total_episode_reward:{total_episode_reward: .2f}")
                 print(f"total_elapsed_time:{total_elapsed_time: .2f}")
 
