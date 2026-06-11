@@ -1,6 +1,7 @@
 # Created by skywoodsz on 2026/02/07.
 
 import argparse
+import math
 import os
 import time
 import json
@@ -183,9 +184,14 @@ def play() -> tuple[float, float]:
                     robot = env.unwrapped.scene["robot"]
                     root_pos = robot.data.root_pos_w[0].cpu().numpy()
                     root_vel = robot.data.root_lin_vel_b[0].cpu().numpy()
+                    root_ang_vel = robot.data.root_ang_vel_b[0].cpu().numpy()
                     root_quat = robot.data.root_quat_w[0].cpu().numpy()
+                    qw, qx, qy, qz = root_quat
+                    root_yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
                     print(f"  Root: pos=[{root_pos[0]:.2f}, {root_pos[1]:.2f}, {root_pos[2]:.2f}], "
-                          f"vel_b=[{root_vel[0]:.2f}, {root_vel[1]:.2f}, {root_vel[2]:.2f}]")
+                          f"vel_b=[{root_vel[0]:.2f}, {root_vel[1]:.2f}, {root_vel[2]:.2f}], "
+                          f"ang_vel_b=[{root_ang_vel[0]:.2f}, {root_ang_vel[1]:.2f}, {root_ang_vel[2]:.2f}], "
+                          f"yaw={root_yaw:+.2f}rad")
 
                     # Foot contact diagnostics with full details
                     if contact_sensor is not None and foot_names is not None:

@@ -940,8 +940,18 @@ def signed_trot_action_mirror(
     Same as signed_trot_joint_mirror but applied to actions instead of joint positions.
     This encourages symmetric control commands to diagonal leg pairs.
     """
-    asset: Articulation = env.scene[asset_cfg.name]
-    actions = env.action_manager.action[:, asset_cfg.joint_ids]  # (num_envs, 12)
+    actions_all = env.action_manager.action
+    joint_ids = asset_cfg.joint_ids
+
+    # The action tensor is ordered by the action term, not by articulation joint ids.
+    # On B2 these ids happen to match. On B2Piper the robot has passive arm joints,
+    # so leg articulation ids can exceed the 12-D leg action tensor.
+    if isinstance(joint_ids, slice):
+        actions = actions_all[:, joint_ids]
+    elif actions_all.shape[1] == len(joint_ids):
+        actions = actions_all
+    else:
+        actions = actions_all[:, joint_ids]
 
     # Extract diagonal pairs
     FR_act = actions[:, 0:3]

@@ -24,6 +24,16 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
         "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
     ]
+    arm_stow_joint_pos = {
+        "arm_joint1": 0.0,
+        "arm_joint2": 1.2,
+        "arm_joint3": 0.0,
+        "arm_joint4": -1.5,
+        "arm_joint5": 0.0,
+        "arm_joint6": 0.0,
+        "arm_joint7": 0.0,
+        "arm_joint8": 0.0,
+    }
     # fmt: on
 
     def __post_init__(self):
@@ -35,17 +45,8 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
         self.scene.height_scanner_base.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
 
-        # Fix arm joints in stow configuration
-        self.scene.robot.init_state.joint_pos.update({
-            "arm_joint1": 0.0,
-            "arm_joint2": 1.2,
-            "arm_joint3": 0.0,
-            "arm_joint4": -1.5,
-            "arm_joint5": 0.0,
-            "arm_joint6": 0.0,
-            "arm_joint7": 0.0,
-            "arm_joint8": 0.0,
-        })
+        # Train with the real B2Piper body while keeping the arm stowed.
+        self.scene.robot.init_state.joint_pos.update(self.arm_stow_joint_pos)
 
         # ------------------------------Observations------------------------------
         self.observations.policy.base_lin_vel.scale = 2.0
@@ -121,6 +122,17 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
             ["FR_(hip|thigh|calf).*", "RL_(hip|thigh|calf).*"],
             ["FL_(hip|thigh|calf).*", "RR_(hip|thigh|calf).*"],
         ]
+        for reward_term in (
+            self.rewards.joint_torques_l2,
+            self.rewards.joint_vel_l2,
+            self.rewards.joint_acc_l2,
+            self.rewards.joint_pos_limits,
+            self.rewards.joint_vel_limits,
+            self.rewards.joint_power,
+            self.rewards.stand_still,
+            self.rewards.joint_pos_penalty,
+        ):
+            reward_term.params["asset_cfg"].joint_names = self.leg_joint_names
 
         # Action penalties
         self.rewards.action_rate_l2.weight = -0.01

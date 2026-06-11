@@ -2,6 +2,8 @@
 
 import gymnasium as gym
 
+from . import agents
+
 ##
 # Register Gym environments.
 ##
@@ -12,6 +14,6 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeB2PiperRoughEnvCfg",
-        "rsl_rl_cfg_entry_point": "atec_rl_lab.train.locomotion.velocity.config.quadruped.unitree_b2.agents.rsl_rl_ppo_cfg:UnitreeB2RoughPPORunnerCfg"
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2PiperRoughPPORunnerCfg",
     },
 )
