@@ -10,7 +10,7 @@ class AlgSolution:
 
     def __init__(self):
         # 使用你训练好的策略
-        policy_path = './logs/rsl_rl/unitree_b2_piper_rough/2026-06-10_23-11-21/exported/policy.pt'
+        policy_path = './logs/rsl_rl/unitree_b2_piper_rough/2026-06-12_12-15-45/exported/policy.pt'
 
         # 调试用 baseline：
         # policy_path = './atec_robot_model/baseline/unitree_b2_flat/policy.pt'
@@ -78,14 +78,25 @@ class AlgSolution:
         self.debug_print_interval = 10
         self._step_counter = 0
 
-        # Adaptive velocity scheduling - REVISED with lower rough terrain speed
+        # Adaptive velocity scheduling - slope-aware with instability protection
         self.velocity_schedule = {
             "flat_fast": 0.75,     # x < -115 (flat terrain)
             "rough": 0.50,         # -115 <= x < -35 (rough terrain)
-            "slope": 0.45,         # -35 <= x < 45 (slope terrain)
+            "slope": 0.35,         # -35 <= x < 45 (slope terrain) - REDUCED for stability
             "stairs": 0.40,        # 45 <= x < 125 (stairs terrain)
             "final": 0.60,         # 125 <= x < 145 (final stretch)
         }
+
+        # Slope-specific control gains
+        self.slope_k_yaw_boost = 1.4       # Multiply k_yaw in slope region
+        self.slope_kd_boost = 1.3          # Multiply kd in slope region
+        self.slope_region = (-35, 45)      # x range for slope terrain
+
+        # Instability protection thresholds
+        self.ang_vel_xy_thresh = 0.8       # rad/s, roll/pitch angular velocity alarm
+        self.vel_z_thresh = 0.4            # m/s, vertical velocity alarm
+        self.instability_slowdown = 0.5    # Multiply forward vel when unstable
+        self.instability_lat_reduce = 0.6  # Multiply lateral cmd when unstable
 
         # Progress tracking with world-frame position estimation
         self.estimated_x = None
@@ -236,6 +247,11 @@ class AlgSolution:
             + torch.cos(roll) * base_ang_vel[:, 2]
         ) / cos_pitch
 
+        # ---- Instability detection: high roll/pitch rate or vertical velocity ----
+        ang_vel_xy_mag = torch.sqrt(base_ang_vel[:, 0]**2 + base_ang_vel[:, 1]**2)
+        vel_z_mag = torch.abs(base_lin_vel[:, 2])
+        is_unstable = (ang_vel_xy_mag > self.ang_vel_xy_thresh) | (vel_z_mag > self.vel_z_thresh)
+
         # ---- Init world-frame state estimates on first call ----
         if self.estimated_yaw is None:
             self.estimated_yaw = torch.zeros(num_envs, device=self.device, dtype=proprio.dtype)
@@ -256,6 +272,12 @@ class AlgSolution:
         # ---- Stuck recovery (kept; lateral kept ~0) ----
         in_recovery, forward_adjust, lateral_recovery = self._check_stuck_and_recover()
 
+        # ---- Slope-aware gain boosting ----
+        x_estimate = self.estimated_x[0].item()
+        in_slope = (self.slope_region[0] <= x_estimate < self.slope_region[1])
+        k_yaw_eff = self.k_yaw * (self.slope_k_yaw_boost if in_slope else 1.0)
+        kd_eff = self.kd * (self.slope_kd_boost if in_slope else 1.0)
+
         # ---- |y| guard: decide forward slowdown and cross-track boost ----
         abs_y_scalar = float(torch.abs(self.estimated_y[0]).item())
         k_track_eff = self.k_track
@@ -265,9 +287,9 @@ class AlgSolution:
         # ---- Heading-lock + cross-track yaw rate (vectorized) ----
         track_term = torch.tanh(self.estimated_y / self.y_scale)
         yaw_rate_cmd = self.yaw_sign * (
-            - self.k_yaw   * self.estimated_yaw
+            - k_yaw_eff    * self.estimated_yaw
             - k_track_eff  * track_term
-            - self.kd      * yaw_rate_measured
+            - kd_eff       * yaw_rate_measured
             - self.kvy     * body_vy
         ) + self.yaw_bias
 
@@ -281,13 +303,14 @@ class AlgSolution:
             )
         yaw_rate_cmd = torch.clip(self.yaw_rate_filtered, -self.yaw_clip, self.yaw_clip)
 
-        # ---- Adaptive forward velocity with |y|-based slowdown ----
-        x_estimate = self.estimated_x[0].item()
+        # ---- Adaptive forward velocity with |y|-based slowdown and instability protection ----
         forward_vel = self._get_adaptive_velocity(x_estimate)
         if abs_y_scalar > self.y_slow_thresh:
             forward_vel *= self.y_slow_factor
         if abs_y_scalar > self.y_hard_thresh:
             forward_vel *= self.y_hard_factor
+        if is_unstable[0].item():
+            forward_vel *= self.instability_slowdown
         if in_recovery:
             forward_vel += forward_adjust
 
@@ -298,6 +321,8 @@ class AlgSolution:
         # Lateral correction: body +y is left; positive estimated_y should command rightward motion.
         if self.use_lateral_cmd:
             lateral_cmd = self.lateral_sign * self.k_lateral * track_term - self.k_lateral_damping * body_vy
+            if is_unstable[0].item():
+                lateral_cmd *= self.instability_lat_reduce
             if in_recovery:
                 lateral_cmd = lateral_cmd + torch.full_like(lateral_cmd, lateral_recovery)
             cmd[:, 1] = torch.clip(lateral_cmd, -self.cmd_y_clip, self.cmd_y_clip)
@@ -320,7 +345,8 @@ class AlgSolution:
                 f"yaw_rate_meas={yaw_rate_measured[0].item():+.3f} "
                 f"cmd_y={cmd[0, 1].item():+.3f} "
                 f"fwd={forward_vel:.2f} body_vy={body_vy[0].item():+.3f} "
-                f"k_track={k_track_eff:.2f}"
+                f"k_track={k_track_eff:.2f} k_yaw={k_yaw_eff:.2f} "
+                f"unstable={is_unstable[0].item()}"
             )
         self._step_counter += 1
 

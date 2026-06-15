@@ -48,6 +48,40 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Train with the real B2Piper body while keeping the arm stowed.
         self.scene.robot.init_state.joint_pos.update(self.arm_stow_joint_pos)
 
+        # TaskA-oriented terrain with emphasis on slopes + rough
+        from isaaclab.terrains import TerrainGeneratorCfg
+        import isaaclab.terrains as terrain_gen
+        self.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=0, size=(8.0, 8.0), border_width=0.0,
+            num_rows=10, num_cols=20, horizontal_scale=0.1, vertical_scale=0.005,
+            slope_threshold=0.75, curriculum=True, use_cache=False,
+            sub_terrains={
+                "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.15),
+                "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+                    proportion=0.25, noise_range=(0.02, 0.10), noise_step=0.02, border_width=0.25
+                ),
+                "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+                    proportion=0.20, slope_range=(0.35, 0.40), platform_width=2.5, border_width=0.25
+                ),
+                "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+                    proportion=0.20, slope_range=(0.35, 0.40), platform_width=2.5, border_width=0.25
+                ),
+                "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+                    proportion=0.10, step_height_range=(0.05, 0.18), step_width=0.3,
+                    platform_width=3.0, border_width=1.0, holes=False
+                ),
+                "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+                    proportion=0.10, step_height_range=(0.05, 0.18), step_width=0.3,
+                    platform_width=3.0, border_width=1.0, holes=False
+                ),
+            },
+        )
+
+        # ------------------------------Commands (TaskA-focused)------------------------------
+        self.commands.base_velocity.ranges.lin_vel_x = (0.2, 0.8)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.15, 0.15)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.25, 0.25)
+
         # ------------------------------Observations------------------------------
         self.observations.policy.base_lin_vel.scale = 2.0
         self.observations.policy.base_ang_vel.scale = 0.25
@@ -93,15 +127,14 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_apply_external_force_torque.params["force_range"] = (-30.0, 30.0)
         self.events.randomize_apply_external_force_torque.params["torque_range"] = (-10.0, 10.0)
 
-        # ------------------------------Rewards------------------------------
-        # Copy all reward weights from UnitreeB2RoughEnvCfg
+        # ------------------------------Rewards (TaskA-tuned)------------------------------
         # General
         self.rewards.is_terminated.weight = -2.0
 
-        # Root penalties
+        # Root penalties - increase orientation stability on slopes
         self.rewards.lin_vel_z_l2.weight = -1.0
-        self.rewards.ang_vel_xy_l2.weight = -0.05
-        self.rewards.flat_orientation_l2.weight = -1.5
+        self.rewards.ang_vel_xy_l2.weight = -0.15
+        self.rewards.flat_orientation_l2.weight = -2.0
         self.rewards.base_height_l2.weight = -0.5
         self.rewards.base_height_l2.params["target_height"] = 0.53
         self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
@@ -143,11 +176,11 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.contact_forces.weight = -1.5e-4
         self.rewards.contact_forces.params["sensor_cfg"].body_names = [self.foot_link_name]
 
-        # Velocity-tracking rewards - CRITICAL for forward motion
+        # Velocity-tracking rewards - increase heading lock for straight line
         self.rewards.track_lin_vel_xy_exp.weight = 6.0
-        self.rewards.track_ang_vel_z_exp.weight = 2.0
+        self.rewards.track_ang_vel_z_exp.weight = 2.5
 
-        # Gait rewards - balanced weights
+        # Gait rewards - strengthen stability
         self.rewards.feet_air_time.weight = 0.0
         self.rewards.feet_air_time.params["threshold"] = 0.3
         self.rewards.feet_air_time.params["sensor_cfg"].body_names = [self.foot_link_name]
@@ -160,12 +193,12 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_contact.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_contact.params["expect_contact_num"] = 2
 
-        # NEW TROT GAIT REWARDS
-        self.rewards.current_contact_count_penalty.weight = -1.0
+        # NEW TROT GAIT REWARDS - strengthen for slope stability
+        self.rewards.current_contact_count_penalty.weight = -1.5
         self.rewards.current_contact_count_penalty.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.current_contact_count_penalty.params["sensor_cfg"].preserve_order = True
 
-        self.rewards.long_air_time_penalty.weight = -1.5
+        self.rewards.long_air_time_penalty.weight = -2.0
         self.rewards.long_air_time_penalty.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.long_air_time_penalty.params["sensor_cfg"].preserve_order = True
 
@@ -183,7 +216,7 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.signed_trot_action_mirror.weight = -0.1
         self.rewards.signed_trot_action_mirror.params["asset_cfg"].joint_names = self.leg_joint_names
 
-        self.rewards.diagonal_pair_duty_balance_penalty.weight = -2.0
+        self.rewards.diagonal_pair_duty_balance_penalty.weight = -2.5
         self.rewards.diagonal_pair_duty_balance_penalty.params["sensor_cfg"].body_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         self.rewards.diagonal_pair_duty_balance_penalty.params["sensor_cfg"].preserve_order = True
 
@@ -191,7 +224,7 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_contact_without_cmd.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_stumble.weight = -0.1
         self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
-        self.rewards.feet_slide.weight = -0.5
+        self.rewards.feet_slide.weight = -0.8
         self.rewards.feet_slide.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_height.weight = 0

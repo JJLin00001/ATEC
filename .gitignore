@@ -4,6 +4,7 @@ atec_robot_model
 video
 logs
 tmp
+push/
 
 # C++
 **/cmake-build*/
