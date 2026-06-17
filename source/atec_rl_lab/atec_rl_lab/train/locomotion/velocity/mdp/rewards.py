@@ -759,6 +759,65 @@ def long_air_time_penalty(
     return penalty
 
 
+def long_contact_time_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    contact_time_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize feet that stay in contact for too long while moving.
+
+    This targets the common rough-terrain failure mode where one foot remains
+    pinned on an obstacle while the other feet keep cycling or stay airborne.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    current_contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    excess_contact_time = torch.clamp(current_contact_time - contact_time_threshold, min=0.0)
+    penalty = torch.sum(excess_contact_time, dim=1)
+
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty
+
+
+def swing_foot_clearance_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    min_height: float,
+    force_threshold: float,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize swing feet that remain too low in the base frame.
+
+    Feet closer to the body have less chance of catching rough terrain edges.
+    The term is applied only to feet currently considered airborne.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    force_magnitude = torch.linalg.norm(net_forces, dim=2)
+    in_air = force_magnitude <= force_threshold
+
+    foot_pos_rel_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :] - asset.data.root_pos_w[:, :].unsqueeze(1)
+    num_feet = len(asset_cfg.body_ids)
+    root_quat = asset.data.root_quat_w.unsqueeze(1).expand(-1, num_feet, -1).reshape(-1, 4)
+    foot_pos_b = math_utils.quat_apply_inverse(root_quat, foot_pos_rel_w.reshape(-1, 3)).reshape(
+        env.num_envs, num_feet, 3
+    )
+
+    low_clearance = torch.clamp(min_height - foot_pos_b[:, :, 2], min=0.0)
+    penalty = torch.sum(low_clearance * in_air.float(), dim=1)
+
+    penalty *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > 0.1
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+
+    return penalty
+
+
 def diagonal_trot_contact_reward(
     env: ManagerBasedRLEnv,
     command_name: str,

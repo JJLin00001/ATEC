@@ -10,7 +10,7 @@ class AlgSolution:
 
     def __init__(self):
         # 使用你训练好的策略
-        policy_path = './logs/rsl_rl/unitree_b2_piper_rough/2026-06-12_12-15-45/exported/policy.pt'
+        policy_path = './logs/rsl_rl/unitree_b2_piper_rough/2026-06-15_21-15-31/exported/policy.pt'
 
         # 调试用 baseline：
         # policy_path = './atec_robot_model/baseline/unitree_b2_flat/policy.pt'
@@ -77,26 +77,106 @@ class AlgSolution:
         self.debug = ("--debug" in sys.argv)
         self.debug_print_interval = 10
         self._step_counter = 0
+        self.use_ground_truth_pose = True
+        self._pose_source = "estimate"
 
         # Adaptive velocity scheduling - slope-aware with instability protection
         self.velocity_schedule = {
-            "flat_fast": 0.75,     # x < -115 (flat terrain)
-            "rough": 0.50,         # -115 <= x < -35 (rough terrain)
-            "slope": 0.35,         # -35 <= x < 45 (slope terrain) - REDUCED for stability
-            "stairs": 0.40,        # 45 <= x < 125 (stairs terrain)
+            "flat_fast": 0.85,     # x < -115 (flat terrain)
+            "rough": 0.50,         # -115 <= x < -35 (rough terrain) - modestly faster, guards still slow it down
+            "slope": 0.42,         # -35 <= x < 45 (slope terrain) - radar guard keeps this conservative
+            "stairs": 0.45,        # 45 <= x < 125 (stairs terrain) - keep enough momentum for tall steps
             "final": 0.60,         # 125 <= x < 145 (final stretch)
         }
 
-        # Slope-specific control gains
-        self.slope_k_yaw_boost = 1.4       # Multiply k_yaw in slope region
-        self.slope_kd_boost = 1.3          # Multiply kd in slope region
-        self.slope_region = (-35, 45)      # x range for slope terrain
+        # Terrain-specific control profiles.
+        # Rough terrain previously over-used the flat yaw_bias and slowly accumulated right drift.
+        self.control_profiles = {
+            "flat_fast": {
+                "yaw_bias": -0.08,
+                "k_yaw": self.k_yaw,
+                "k_track": self.k_track,
+                "kd": self.kd,
+                "kvy": self.kvy,
+                "k_lateral": self.k_lateral,
+                "lateral_damping": self.k_lateral_damping,
+                "cmd_y_clip": self.cmd_y_clip,
+                "yaw_clip": self.yaw_clip,
+            },
+            "rough": {
+                "yaw_bias": -0.03,
+                "k_yaw": 1.85,
+                "k_track": 0.80,
+                "kd": 0.30,
+                "kvy": 0.28,
+                "k_lateral": 0.45,
+                "lateral_damping": 0.25,
+                "cmd_y_clip": 0.35,
+                "yaw_clip": 0.75,
+            },
+            "slope": {
+                "yaw_bias": -0.02,
+                "k_yaw": 2.10,
+                "k_track": 0.65,
+                "kd": 0.35,
+                "kvy": 0.30,
+                "k_lateral": 0.30,
+                "lateral_damping": 0.25,
+                "cmd_y_clip": 0.25,
+                "yaw_clip": 0.65,
+            },
+            "stairs": {
+                "yaw_bias": -0.03,
+                "k_yaw": 1.90,
+                "k_track": 0.70,
+                "kd": 0.30,
+                "kvy": 0.25,
+                "k_lateral": 0.30,
+                "lateral_damping": 0.20,
+                "cmd_y_clip": 0.25,
+                "yaw_clip": 0.65,
+            },
+            "final": {
+                "yaw_bias": -0.05,
+                "k_yaw": 1.70,
+                "k_track": 0.80,
+                "kd": 0.25,
+                "kvy": 0.20,
+                "k_lateral": 0.45,
+                "lateral_damping": 0.20,
+                "cmd_y_clip": 0.40,
+                "yaw_clip": 0.80,
+            },
+        }
 
         # Instability protection thresholds
         self.ang_vel_xy_thresh = 0.8       # rad/s, roll/pitch angular velocity alarm
         self.vel_z_thresh = 0.4            # m/s, vertical velocity alarm
         self.instability_slowdown = 0.5    # Multiply forward vel when unstable
         self.instability_lat_reduce = 0.6  # Multiply lateral cmd when unstable
+        self.unstable_forward_cap = 0.18   # Do not keep pushing when the body is already pitching/rolling hard
+        self.unstable_yaw_clip = 0.35
+        self.unstable_cmd_y_clip = 0.10
+
+        # Lidar is used only for outer-loop conservative scheduling.  The learned
+        # policy input stays proprioceptive so the exported 47-D policy remains compatible.
+        self.use_lidar_guard = True
+        self.lidar_abs_clip = 20.0
+        self.lidar_centered_clip = 3.0
+        self.lidar_roughness_warn = 0.18
+        self.lidar_roughness_range = 0.35
+        self.lidar_span_warn = 0.45
+        self.lidar_span_range = 1.20
+        self.lidar_risk_alpha = 0.25
+        self.lidar_min_speed_scale = 0.55
+        self.slope_lidar_min_speed_scale = 0.85
+        self.stairs_lidar_min_speed_scale = 0.75
+        self.lidar_min_yaw_clip = 0.45
+        self.lidar_min_cmd_y_clip = 0.12
+        self.lidar_recovery_risk_threshold = 0.65
+        self.lidar_risk_filtered = None
+        self._last_lidar_guard = None
+        self._lidar_error_printed = False
 
         # Progress tracking with world-frame position estimation
         self.estimated_x = None
@@ -153,18 +233,125 @@ class AlgSolution:
     def get_action_spec(self) -> dict[str, dict[str, Any]] | None:
         return {}
 
+    def _get_terrain_stage(self, x_estimate: float) -> str:
+        """Return the approximate TaskA terrain stage from estimated forward progress."""
+        if x_estimate < -115:
+            return "flat_fast"
+        elif x_estimate < -35:
+            return "rough"
+        elif x_estimate < 45:
+            return "slope"
+        elif x_estimate < 125:
+            return "stairs"
+        else:
+            return "final"
+
     def _get_adaptive_velocity(self, x_estimate: float) -> float:
         """Compute adaptive forward velocity based on estimated x position."""
-        if x_estimate < -115:
-            return self.velocity_schedule["flat_fast"]
-        elif x_estimate < -35:
-            return self.velocity_schedule["rough"]
-        elif x_estimate < 45:
-            return self.velocity_schedule["slope"]
-        elif x_estimate < 125:
-            return self.velocity_schedule["stairs"]
-        else:
-            return self.velocity_schedule["final"]
+        return self.velocity_schedule[self._get_terrain_stage(x_estimate)]
+
+    def _empty_lidar_guard(self, num_envs: int, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        zeros = torch.zeros(num_envs, device=self.device, dtype=dtype)
+        ones = torch.ones(num_envs, device=self.device, dtype=dtype)
+        return {
+            "risk": zeros,
+            "roughness": zeros,
+            "span": zeros,
+            "valid_ratio": ones,
+            "available": torch.zeros(num_envs, device=self.device, dtype=torch.bool),
+        }
+
+    def _get_lidar_guard(self, obs, dtype: torch.dtype, num_envs: int) -> dict[str, torch.Tensor]:
+        """Estimate local terrain risk from extero/lidar observations for conservative scheduling."""
+        guard = self._empty_lidar_guard(num_envs, dtype)
+        if not self.use_lidar_guard or not isinstance(obs, dict) or "extero" not in obs:
+            self._last_lidar_guard = guard
+            return guard
+
+        extero = obs.get("extero")
+        if extero is None:
+            self._last_lidar_guard = guard
+            return guard
+
+        try:
+            scan = extero.to(device=self.device, dtype=torch.float32)
+            if scan.ndim == 1:
+                scan = scan.unsqueeze(0)
+            if scan.shape[0] != num_envs:
+                if scan.numel() % num_envs != 0:
+                    self._last_lidar_guard = guard
+                    return guard
+                scan = scan.reshape(num_envs, -1)
+            else:
+                scan = scan.reshape(num_envs, -1)
+
+            finite = torch.isfinite(scan) & (torch.abs(scan) < self.lidar_abs_clip)
+            valid_count = finite.float().sum(dim=1).clamp_min(1.0)
+            valid_ratio = finite.float().mean(dim=1)
+            safe_scan = torch.where(finite, scan, torch.zeros_like(scan))
+            mean = safe_scan.sum(dim=1) / valid_count
+            centered = torch.where(finite, scan - mean.unsqueeze(1), torch.zeros_like(scan))
+
+            roughness = torch.sqrt((centered.square().sum(dim=1) / valid_count).clamp_min(0.0))
+            centered_clip = torch.clamp(centered, -self.lidar_centered_clip, self.lidar_centered_clip)
+            span = centered_clip.max(dim=1)[0] - centered_clip.min(dim=1)[0]
+
+            rough_risk = (roughness - self.lidar_roughness_warn) / self.lidar_roughness_range
+            span_risk = (span - self.lidar_span_warn) / self.lidar_span_range
+            risk = torch.maximum(rough_risk, span_risk).clamp(0.0, 1.0)
+
+            min_valid_count = max(8.0, float(scan.shape[1]) * 0.01)
+            enough_valid = valid_count >= min_valid_count
+            risk = torch.where(enough_valid, risk, torch.zeros_like(risk))
+
+            if self.lidar_risk_filtered is None or self.lidar_risk_filtered.shape != risk.shape:
+                self.lidar_risk_filtered = risk
+            else:
+                self.lidar_risk_filtered = (
+                    (1.0 - self.lidar_risk_alpha) * self.lidar_risk_filtered
+                    + self.lidar_risk_alpha * risk
+                )
+            risk = self.lidar_risk_filtered.clamp(0.0, 1.0)
+
+            guard = {
+                "risk": risk.to(dtype=dtype),
+                "roughness": roughness.to(dtype=dtype),
+                "span": span.to(dtype=dtype),
+                "valid_ratio": valid_ratio.to(dtype=dtype),
+                "available": enough_valid,
+            }
+            self._last_lidar_guard = guard
+            return guard
+        except Exception as exc:
+            if self.debug and not self._lidar_error_printed:
+                print(f"  [lidar] disabled for this run: {exc}")
+                self._lidar_error_printed = True
+            self._last_lidar_guard = guard
+            return guard
+
+    def _get_ground_truth_pose(self, obs, dtype: torch.dtype, num_envs: int):
+        """Read simulator root pose when the local play script provides it."""
+        if not self.use_ground_truth_pose or not isinstance(obs, dict):
+            return None
+        if "_root_pos_w" not in obs or "_root_yaw_w" not in obs:
+            return None
+
+        try:
+            root_pos_w = obs["_root_pos_w"].to(device=self.device, dtype=dtype)
+            root_yaw_w = obs["_root_yaw_w"].to(device=self.device, dtype=dtype).reshape(-1)
+            if root_pos_w.ndim == 1:
+                root_pos_w = root_pos_w.unsqueeze(0)
+            if root_pos_w.shape[0] != num_envs or root_pos_w.shape[1] < 2:
+                return None
+            if root_yaw_w.shape[0] != num_envs:
+                return None
+
+            x_w = root_pos_w[:, 0]
+            y_w = root_pos_w[:, 1]
+            yaw_w = torch.atan2(torch.sin(root_yaw_w), torch.cos(root_yaw_w))
+            return x_w, y_w, yaw_w
+        except Exception:
+            return None
 
     def _check_stuck_and_recover(self) -> tuple[bool, float, float]:
         """Detect stuck condition and return recovery commands.
@@ -213,7 +400,7 @@ class AlgSolution:
 
         return False, 0.0, 0.0
 
-    def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
+    def _get_velocity_commands(self, proprio: torch.Tensor, obs=None) -> torch.Tensor:
         """Compute velocity commands using heading-lock + cross-track control.
 
         Strategy: 强制朝世界 +x 方向（estimated_yaw -> 0），并对 y 偏离做 tanh 软回正，
@@ -251,6 +438,9 @@ class AlgSolution:
         ang_vel_xy_mag = torch.sqrt(base_ang_vel[:, 0]**2 + base_ang_vel[:, 1]**2)
         vel_z_mag = torch.abs(base_lin_vel[:, 2])
         is_unstable = (ang_vel_xy_mag > self.ang_vel_xy_thresh) | (vel_z_mag > self.vel_z_thresh)
+        unstable_scalar = bool(is_unstable[0].item())
+        lidar_guard = self._get_lidar_guard(obs, proprio.dtype, num_envs)
+        lidar_risk_scalar = float(lidar_guard["risk"][0].item())
 
         # ---- Init world-frame state estimates on first call ----
         if self.estimated_yaw is None:
@@ -258,31 +448,80 @@ class AlgSolution:
             self.estimated_x = torch.full((num_envs,), -141.0, device=self.device, dtype=proprio.dtype)
             self.estimated_y = torch.zeros(num_envs, device=self.device, dtype=proprio.dtype)
 
-        # ---- Integrate yaw and world x/y ----
-        self.estimated_yaw = self.estimated_yaw + yaw_rate_measured * self.dt
-        self.estimated_yaw = torch.atan2(torch.sin(self.estimated_yaw), torch.cos(self.estimated_yaw))
+        # ---- Use simulator root pose when available; otherwise integrate yaw and world x/y ----
+        ground_truth_pose = self._get_ground_truth_pose(obs, proprio.dtype, num_envs)
+        if ground_truth_pose is not None:
+            root_x, root_y, root_yaw = ground_truth_pose
+            self.estimated_x = root_x
+            self.estimated_y = root_y
+            self.estimated_yaw = root_yaw
+            self._pose_source = "root"
+        else:
+            self.estimated_yaw = self.estimated_yaw + yaw_rate_measured * self.dt
+            self.estimated_yaw = torch.atan2(torch.sin(self.estimated_yaw), torch.cos(self.estimated_yaw))
 
-        cos_yaw = torch.cos(self.estimated_yaw)
-        sin_yaw = torch.sin(self.estimated_yaw)
-        vel_world_x = base_lin_vel[:, 0] * cos_yaw - base_lin_vel[:, 1] * sin_yaw
-        vel_world_y = base_lin_vel[:, 0] * sin_yaw + base_lin_vel[:, 1] * cos_yaw
-        self.estimated_x = self.estimated_x + vel_world_x * self.dt
-        self.estimated_y = self.estimated_y + vel_world_y * self.dt
+            cos_yaw = torch.cos(self.estimated_yaw)
+            sin_yaw = torch.sin(self.estimated_yaw)
+            vel_world_x = base_lin_vel[:, 0] * cos_yaw - base_lin_vel[:, 1] * sin_yaw
+            vel_world_y = base_lin_vel[:, 0] * sin_yaw + base_lin_vel[:, 1] * cos_yaw
+            self.estimated_x = self.estimated_x + vel_world_x * self.dt
+            self.estimated_y = self.estimated_y + vel_world_y * self.dt
+            self._pose_source = "estimate"
 
         # ---- Stuck recovery (kept; lateral kept ~0) ----
         in_recovery, forward_adjust, lateral_recovery = self._check_stuck_and_recover()
+        if unstable_scalar:
+            in_recovery = False
+            forward_adjust = 0.0
+            lateral_recovery = 0.0
+        elif lidar_risk_scalar > self.lidar_recovery_risk_threshold and forward_adjust > 0.0:
+            # On rough/slope terrain, a blind forward push often turns a snag into a fall.
+            forward_adjust = 0.0
 
-        # ---- Slope-aware gain boosting ----
+        # ---- Terrain-aware gain selection ----
         x_estimate = self.estimated_x[0].item()
-        in_slope = (self.slope_region[0] <= x_estimate < self.slope_region[1])
-        k_yaw_eff = self.k_yaw * (self.slope_k_yaw_boost if in_slope else 1.0)
-        kd_eff = self.kd * (self.slope_kd_boost if in_slope else 1.0)
+        terrain_stage = self._get_terrain_stage(x_estimate)
+        profile = self.control_profiles[terrain_stage]
+        yaw_bias_eff = profile["yaw_bias"]
+        k_yaw_eff = profile["k_yaw"]
+        kd_eff = profile["kd"]
+        kvy_eff = profile["kvy"]
+        k_lateral_eff = profile["k_lateral"]
+        lateral_damping_eff = profile["lateral_damping"]
+        cmd_y_clip_eff = profile["cmd_y_clip"]
+        yaw_clip_eff = profile["yaw_clip"]
+
+        if lidar_risk_scalar > 0.0:
+            speed_scale = 1.0 - lidar_risk_scalar * (1.0 - self.lidar_min_speed_scale)
+            if terrain_stage == "slope":
+                speed_scale = max(speed_scale, self.slope_lidar_min_speed_scale)
+            elif terrain_stage == "stairs":
+                speed_scale = max(speed_scale, self.stairs_lidar_min_speed_scale)
+            yaw_clip_eff = min(
+                yaw_clip_eff,
+                self.lidar_min_yaw_clip + (1.0 - lidar_risk_scalar) * (yaw_clip_eff - self.lidar_min_yaw_clip),
+            )
+            cmd_y_clip_eff = min(
+                cmd_y_clip_eff,
+                self.lidar_min_cmd_y_clip + (1.0 - lidar_risk_scalar) * (cmd_y_clip_eff - self.lidar_min_cmd_y_clip),
+            )
+        else:
+            speed_scale = 1.0
+
+        if unstable_scalar:
+            yaw_clip_eff = min(yaw_clip_eff, self.unstable_yaw_clip)
+            cmd_y_clip_eff = min(cmd_y_clip_eff, self.unstable_cmd_y_clip)
+
+        if terrain_stage == "slope" and forward_adjust < 0.0:
+            in_recovery = False
+            forward_adjust = 0.0
+            lateral_recovery = 0.0
 
         # ---- |y| guard: decide forward slowdown and cross-track boost ----
         abs_y_scalar = float(torch.abs(self.estimated_y[0]).item())
-        k_track_eff = self.k_track
+        k_track_eff = profile["k_track"]
         if abs_y_scalar > self.y_hard_thresh:
-            k_track_eff = self.k_track * self.k_track_boost
+            k_track_eff = profile["k_track"] * self.k_track_boost
 
         # ---- Heading-lock + cross-track yaw rate (vectorized) ----
         track_term = torch.tanh(self.estimated_y / self.y_scale)
@@ -290,10 +529,10 @@ class AlgSolution:
             - k_yaw_eff    * self.estimated_yaw
             - k_track_eff  * track_term
             - kd_eff       * yaw_rate_measured
-            - self.kvy     * body_vy
-        ) + self.yaw_bias
+            - kvy_eff      * body_vy
+        ) + yaw_bias_eff
 
-        # ---- Low-pass filter + clip to [-yaw_clip, yaw_clip] ----
+        # ---- Low-pass filter + terrain-specific clipping ----
         if self.yaw_rate_filtered is None:
             self.yaw_rate_filtered = yaw_rate_cmd.clone()
         else:
@@ -301,7 +540,7 @@ class AlgSolution:
                 (1 - self.yaw_rate_alpha) * self.yaw_rate_filtered
                 + self.yaw_rate_alpha * yaw_rate_cmd
             )
-        yaw_rate_cmd = torch.clip(self.yaw_rate_filtered, -self.yaw_clip, self.yaw_clip)
+        yaw_rate_cmd = torch.clip(self.yaw_rate_filtered, -yaw_clip_eff, yaw_clip_eff)
 
         # ---- Adaptive forward velocity with |y|-based slowdown and instability protection ----
         forward_vel = self._get_adaptive_velocity(x_estimate)
@@ -309,8 +548,9 @@ class AlgSolution:
             forward_vel *= self.y_slow_factor
         if abs_y_scalar > self.y_hard_thresh:
             forward_vel *= self.y_hard_factor
-        if is_unstable[0].item():
-            forward_vel *= self.instability_slowdown
+        forward_vel *= speed_scale
+        if unstable_scalar:
+            forward_vel = min(forward_vel * self.instability_slowdown, self.unstable_forward_cap)
         if in_recovery:
             forward_vel += forward_adjust
 
@@ -320,16 +560,16 @@ class AlgSolution:
 
         # Lateral correction: body +y is left; positive estimated_y should command rightward motion.
         if self.use_lateral_cmd:
-            lateral_cmd = self.lateral_sign * self.k_lateral * track_term - self.k_lateral_damping * body_vy
-            if is_unstable[0].item():
+            lateral_cmd = self.lateral_sign * k_lateral_eff * track_term - lateral_damping_eff * body_vy
+            if unstable_scalar:
                 lateral_cmd *= self.instability_lat_reduce
             if in_recovery:
                 lateral_cmd = lateral_cmd + torch.full_like(lateral_cmd, lateral_recovery)
-            cmd[:, 1] = torch.clip(lateral_cmd, -self.cmd_y_clip, self.cmd_y_clip)
+            cmd[:, 1] = torch.clip(lateral_cmd, -cmd_y_clip_eff, cmd_y_clip_eff)
         elif in_recovery:
             cmd[:, 1] = torch.clip(
                 torch.tensor(lateral_recovery, device=self.device, dtype=proprio.dtype),
-                -self.cmd_y_clip, self.cmd_y_clip,
+                -cmd_y_clip_eff, cmd_y_clip_eff,
             )
 
         cmd[:, 2] = yaw_rate_cmd
@@ -341,12 +581,17 @@ class AlgSolution:
             yr_val = yaw_rate_cmd[0].item() if yaw_rate_cmd.dim() > 0 else float(yaw_rate_cmd)
             print(
                 f"  [path] est_y={y_val:+.3f}m est_yaw={yaw_val:+.3f}rad "
-                f"yaw_rate_cmd={yr_val:+.3f} yaw_bias={self.yaw_bias:+.3f} "
+                f"stage={terrain_stage} yaw_rate_cmd={yr_val:+.3f} yaw_bias={yaw_bias_eff:+.3f} "
                 f"yaw_rate_meas={yaw_rate_measured[0].item():+.3f} "
                 f"cmd_y={cmd[0, 1].item():+.3f} "
                 f"fwd={forward_vel:.2f} body_vy={body_vy[0].item():+.3f} "
-                f"k_track={k_track_eff:.2f} k_yaw={k_yaw_eff:.2f} "
-                f"unstable={is_unstable[0].item()}"
+                f"k_track={k_track_eff:.2f} k_yaw={k_yaw_eff:.2f} kd={kd_eff:.2f} "
+                f"pose={self._pose_source} "
+                f"unstable={unstable_scalar} "
+                f"lidar_risk={lidar_risk_scalar:.2f} "
+                f"lidar_rough={lidar_guard['roughness'][0].item():.3f} "
+                f"lidar_span={lidar_guard['span'][0].item():.3f} "
+                f"lidar_valid={lidar_guard['valid_ratio'][0].item():.2f}"
             )
         self._step_counter += 1
 
@@ -400,7 +645,7 @@ class AlgSolution:
         actions_env_leg = actions_all[:, self.leg_joint_indices]
 
         actions_train_leg = actions_env_leg * self.env_to_train_action_scale.to(dtype=proprio.dtype)
-        velocity_commands = self._get_velocity_commands(proprio)
+        velocity_commands = self._get_velocity_commands(proprio, obs)
         phase_obs = self._get_phase_observation()
 
         policy_obs = torch.cat(

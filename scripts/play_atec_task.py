@@ -153,6 +153,24 @@ def play() -> tuple[float, float]:
             start_time = time.time()
 
             # ===== Your controller goes here =====
+            try:
+                if isinstance(obs, dict):
+                    robot_for_solution = env.unwrapped.scene["robot"]
+                    root_pos_w = robot_for_solution.data.root_pos_w.detach()
+                    root_quat_w = robot_for_solution.data.root_quat_w.detach()
+                    qw = root_quat_w[:, 0]
+                    qx = root_quat_w[:, 1]
+                    qy = root_quat_w[:, 2]
+                    qz = root_quat_w[:, 3]
+                    root_yaw_w = torch.atan2(
+                        2.0 * (qw * qz + qx * qy),
+                        1.0 - 2.0 * (qy * qy + qz * qz),
+                    )
+                    obs["_root_pos_w"] = root_pos_w
+                    obs["_root_yaw_w"] = root_yaw_w
+            except Exception:
+                pass
+
             resp = solution.predicts(obs, total_episode_reward)
             giveup = resp["giveup"]
             if giveup:

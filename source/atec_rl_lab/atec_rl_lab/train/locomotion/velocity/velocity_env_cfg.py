@@ -670,6 +670,28 @@ class RewardsCfg:
         },
     )
 
+    long_contact_time_penalty = RewTerm(
+        func=mdp.long_contact_time_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "contact_time_threshold": 0.55,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
+
+    swing_foot_clearance_penalty = RewTerm(
+        func=mdp.swing_foot_clearance_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "min_height": -0.36,
+            "force_threshold": 1.0,
+            "asset_cfg": SceneEntityCfg("robot", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True),
+        },
+    )
+
     diagonal_trot_contact_reward = RewTerm(
         func=mdp.diagonal_trot_contact_reward,
         weight=0.0,
