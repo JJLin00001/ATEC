@@ -10,7 +10,7 @@ class AlgSolution:
 
     def __init__(self):
         # 使用你训练好的策略
-        policy_path = './logs/rsl_rl/unitree_b2_piper_rough/2026-06-15_21-15-31/exported/policy.pt'
+        policy_path = './logs/rsl_rl/unitree_b2_piper_rough/2026-06-17_18-31-35/exported/policy.pt'
 
         # 调试用 baseline：
         # policy_path = './atec_robot_model/baseline/unitree_b2_flat/policy.pt'
@@ -85,7 +85,7 @@ class AlgSolution:
             "flat_fast": 0.85,     # x < -115 (flat terrain)
             "rough": 0.50,         # -115 <= x < -35 (rough terrain) - modestly faster, guards still slow it down
             "slope": 0.42,         # -35 <= x < 45 (slope terrain) - radar guard keeps this conservative
-            "stairs": 0.45,        # 45 <= x < 125 (stairs terrain) - keep enough momentum for tall steps
+            "stairs": 0.50,        # 45 <= x < 125 (stairs terrain) - keep enough momentum for tall steps
             "final": 0.60,         # 125 <= x < 145 (final stretch)
         }
 
@@ -155,6 +155,7 @@ class AlgSolution:
         self.instability_slowdown = 0.5    # Multiply forward vel when unstable
         self.instability_lat_reduce = 0.6  # Multiply lateral cmd when unstable
         self.unstable_forward_cap = 0.18   # Do not keep pushing when the body is already pitching/rolling hard
+        self.stairs_unstable_forward_cap = 0.30
         self.unstable_yaw_clip = 0.35
         self.unstable_cmd_y_clip = 0.10
 
@@ -170,7 +171,7 @@ class AlgSolution:
         self.lidar_risk_alpha = 0.25
         self.lidar_min_speed_scale = 0.55
         self.slope_lidar_min_speed_scale = 0.85
-        self.stairs_lidar_min_speed_scale = 0.75
+        self.stairs_lidar_min_speed_scale = 0.85
         self.lidar_min_yaw_clip = 0.45
         self.lidar_min_cmd_y_clip = 0.12
         self.lidar_recovery_risk_threshold = 0.65
@@ -227,7 +228,7 @@ class AlgSolution:
         ).view(1, -1)
 
         # Action clipping bounds
-        self.leg_action_clip = 2.0
+        self.leg_action_clip = 2.5
         self.arm_action_clip = 2.0
 
     def get_action_spec(self) -> dict[str, dict[str, Any]] | None:
@@ -516,6 +517,11 @@ class AlgSolution:
             in_recovery = False
             forward_adjust = 0.0
             lateral_recovery = 0.0
+        elif terrain_stage == "stairs" and forward_adjust < 0.0:
+            # On stair risers, reversing usually loses foot placement. Let the
+            # recovery state continue, but remove the backward half-cycle.
+            forward_adjust = 0.0
+            lateral_recovery = 0.0
 
         # ---- |y| guard: decide forward slowdown and cross-track boost ----
         abs_y_scalar = float(torch.abs(self.estimated_y[0]).item())
@@ -550,7 +556,12 @@ class AlgSolution:
             forward_vel *= self.y_hard_factor
         forward_vel *= speed_scale
         if unstable_scalar:
-            forward_vel = min(forward_vel * self.instability_slowdown, self.unstable_forward_cap)
+            unstable_cap = (
+                self.stairs_unstable_forward_cap
+                if terrain_stage == "stairs"
+                else self.unstable_forward_cap
+            )
+            forward_vel = min(forward_vel * self.instability_slowdown, unstable_cap)
         if in_recovery:
             forward_vel += forward_adjust
 
